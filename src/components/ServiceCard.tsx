@@ -12,13 +12,18 @@ type Props = {
 export default function ServiceCard({ icon, title, text, meta, cta = 'Use this', onAction }: Props) {
   return (
     <article className="card">
-      {icon && <span className="card-icon">{icon}</span>}
+      {icon && (
+        <span className="card-icon" aria-hidden>
+          {icon}
+        </span>
+      )}
       <h3 className="card-title">{title}</h3>
       {text && <p className="card-text">{text}</p>}
       {meta && <p className="card-meta">{meta}</p>}
       {onAction && (
-        <button className="link-btn" type="button" onClick={onAction}>
-          {cta} →
+        <button className="card-action" type="button" onClick={onAction}>
+          {cta}
+          <span aria-hidden>→</span>
         </button>
       )}
     </article>
