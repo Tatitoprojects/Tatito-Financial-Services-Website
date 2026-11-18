@@ -1,0 +1,270 @@
+import 'dotenv/config';
+import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+
+// Database & Relational Store
+import { dbRepository, initPostgres, ensurePostgresInitialized, isPostgresConnected, isPostgresConfiguredFlag, DatabaseUnavailableError } from './database/db.ts';
+
+// Route Modules
+import authRoutes from './backend/routes/auth.routes.ts';
+import usersRoutes from './backend/routes/users.routes.ts';
+import kycRoutes from './backend/routes/kyc.routes.ts';
+import loansRoutes from './backend/routes/loans.routes.ts';
+import paymentsRoutes from './backend/routes/payments.routes.ts';
+import collectionsRoutes from './backend/routes/collections.routes.ts';
+import financesRoutes from './backend/routes/finances.routes.ts';
+import { supportRoutes } from './backend/routes/support.routes.ts';
+import investmentsRoutes from './backend/routes/investments.routes.ts';
+import adminRoutes from './backend/routes/admin.routes.ts';
+import agentsRoutes from './backend/routes/agents.routes.ts';
+import notificationsRoutes from './backend/routes/notifications.routes.ts';
+import superappRoutes from './backend/routes/superapp.routes.ts';
+import liveRoutes from './backend/routes/live.routes.ts';
+import docsRoutes from './backend/routes/docs.routes.ts';
+import { WebSocketServer } from 'ws';
+import { registerWebSocketServer } from './backend/services/realtime.ts';
+
+import { getJwtSecret } from './backend/middleware/auth.ts';
+import { apiRateLimiter } from './backend/middleware/rateLimiter.ts';
+
+export const app = express();
+app.disable('x-powered-by');
+const envPort = process.env.DEFAULT_APP_PORT || process.env.PORT || '3000';
+const parsedPort = parseInt(envPort, 10);
+// In this container environment, nginx runs on 8080 and proxies to 3000.
+// If PORT is 8080 or invalid, bind to 3000 as required.
+const PORT = (parsedPort === 8080 && process.env.NGINX_PORT === '8080') ? 3000 : (parsedPort || 3000);
+const isProd = process.env.NODE_ENV === 'production';
+
+// Security Headers
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// Strict CORS: Restrict to configured origins in production
+const configuredOrigins = process.env.CORS_ORIGIN 
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim()).filter(Boolean)
+  : [];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!isProd || configuredOrigins.length === 0 || configuredOrigins.includes('*') || configuredOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('CORS Policy: Access forbidden from this origin'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Idempotency-Key', 'X-Requested-With', 'X-Simulate-Failure']
+}));
+
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use('/api', apiRateLimiter);
+app.use('/api', async (_req: Request, _res: Response, next: NextFunction) => {
+  if (process.env.NODE_ENV !== 'test') {
+    await ensurePostgresInitialized();
+  }
+  next();
+});
+
+// Health Check
+app.get('/api/health', async (_req: Request, res: Response) => {
+  if (process.env.NODE_ENV !== 'test') {
+    await ensurePostgresInitialized();
+  }
+  const isPg = isPostgresConnected();
+  res.json({
+    status: 'healthy',
+    service: 'Tatito Financial Services Full-Stack API',
+    runtime: process.env.VERCEL === '1' ? 'vercel_serverless' : 'node_express',
+    database_mode: isPg ? 'PostgreSQL (Connected)' : 'Persistent Fallback Relational Store',
+    postgres_configured: isPostgresConfiguredFlag(),
+    postgres_connected: isPg,
+    branch: 'Kadapa Central Hub, Andhra Pradesh',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Mount API Route Modules
+app.use('/api/auth', authRoutes);
+app.use('/api/users', usersRoutes);
+app.use('/api/customers', usersRoutes); // Alias for /api/customers/profile
+app.use('/api/wallet', (req, res, next) => {
+  req.url = req.url === '/' ? '/wallet' : `/wallet${req.url}`;
+  usersRoutes(req, res, next);
+});
+app.use('/api/kyc', kycRoutes);
+app.use('/api/loans', loansRoutes);
+app.use('/api/loan-products', async (req: Request, res: Response) => {
+  try {
+    const products = await dbRepository.loans.getProducts();
+    res.json(products);
+  } catch (err: any) {
+    if (err.statusCode === 503) {
+      return res.status(503).json({ error: 'Service Unavailable', detail: err.message });
+    }
+    res.status(500).json({ error: 'Internal Error', detail: err.message });
+  }
+});
+app.use('/api/collections', collectionsRoutes);
+app.use('/api/payments', paymentsRoutes);
+app.use('/api/bills', paymentsRoutes); // Alias for BBPS utility bills
+app.use('/api/investments', investmentsRoutes);
+app.use('/api/stocks', (req, res, next) => {
+  if (req.url.startsWith('/watchlist')) {
+    return investmentsRoutes(req, res, next);
+  }
+  req.url = req.url === '/' ? '/stocks' : `/stocks${req.url}`;
+  investmentsRoutes(req, res, next);
+});
+app.use('/api/watchlist', (req, res, next) => {
+  req.url = req.url === '/' ? '/watchlist' : `/watchlist${req.url}`;
+  investmentsRoutes(req, res, next);
+});
+app.use('/api/mutual-funds', (req, res, next) => {
+  req.url = req.url === '/' ? '/mutual-funds' : `/mutual-funds${req.url}`;
+  investmentsRoutes(req, res, next);
+});
+app.use('/api/sips', (req, res, next) => {
+  req.url = req.url === '/' ? '/sips' : `/sips${req.url}`;
+  investmentsRoutes(req, res, next);
+});
+app.use('/api/demat', (req, res, next) => {
+  req.url = req.url === '/' ? '/demat' : `/demat${req.url}`;
+  investmentsRoutes(req, res, next);
+});
+app.use('/api/admin/support-tickets', supportRoutes(true));
+app.use('/api/superapp/support', supportRoutes());
+app.use('/api/admin', adminRoutes);
+app.use('/api/reports', (req, res, next) => {
+  req.url = req.url === '/' ? '/reports/csv' : req.url;
+  adminRoutes(req, res, next);
+});
+app.use('/api/agents', agentsRoutes);
+app.use('/api/notifications', notificationsRoutes);
+app.use('/api/superapp/expenses', financesRoutes);
+app.use('/api/superapp', superappRoutes);
+app.use('/api/live', liveRoutes);
+app.use('/api', docsRoutes);
+
+// Contact / Enquiries endpoint
+app.post('/api/contact', (req: Request, res: Response) => {
+  const { full_name, email, phone, subject, category, message } = req.body;
+  if (!full_name || !email || !phone || !message) {
+    return res.status(400).json({ error: 'Please provide all required enquiry fields' });
+  }
+
+  const newEnquiry = {
+    id: `ENQ-${Date.now()}`,
+    full_name: full_name.trim(),
+    email: email.trim(),
+    phone: phone.trim(),
+    subject: subject || 'General Enquiry',
+    category: category || 'General Support',
+    message: message.trim(),
+    created_at: new Date().toISOString()
+  };
+
+  return res.status(201).json({
+    status: 'RECEIVED',
+    enquiry: newEnquiry,
+    message: 'Enquiry received. Kadapa branch customer advisor will respond within 24 hours.'
+  });
+});
+
+// JSON 404 handler for any unmatched /api/* route
+app.all('/api/*', (req: Request, res: Response) => {
+  return res.status(404).json({
+    error: 'Not Found',
+    detail: `API endpoint ${req.method} ${req.originalUrl} does not exist`
+  });
+});
+
+// Clean React Router SPA routes
+const clientRoutes = [
+  'collections', 'login', 'register', 'dashboard', 'loans', 'loan-application',
+  'emi-calculator', 'investments', 'stocks', 'mutual-funds',
+  'sip-calculator', 'demat', 'wallet', 'bills', 'payments', 'services',
+  'profile', 'notifications', 'admin', 'agents', 'credit-officer'
+];
+
+clientRoutes.forEach((route) => {
+  app.get(`/${route}`, (req: Request, res: Response, next: NextFunction) => {
+    const isProd = process.env.NODE_ENV === 'production';
+    const distPath = path.resolve(process.cwd(), 'dist');
+    const staticRoot = (isProd && fs.existsSync(distPath)) ? distPath : process.cwd();
+    const indexPath = path.resolve(staticRoot, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      return res.sendFile(indexPath);
+    }
+    next();
+  });
+});
+
+// Centralized error handler
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof DatabaseUnavailableError || err.statusCode === 503) {
+    return res.status(503).json({
+      error: 'Service Unavailable',
+      detail: err.message || 'PostgreSQL database required in production mode',
+      database_mode: 'fail_safe'
+    });
+  }
+  console.error('Unhandled Server Error:', err);
+  res.status(err.status || 500).json({ error: 'Internal Error', detail: err.message });
+});
+
+// Static Web Serving & Development Server
+export async function startServer() {
+  await initPostgres();
+  const isProd = process.env.NODE_ENV === 'production';
+  const distPath = path.resolve(process.cwd(), 'dist');
+  const staticRoot = (isProd && fs.existsSync(distPath)) ? distPath : process.cwd();
+
+  // Always serve js, css, and assets explicitly from root or dist
+  app.use('/js', express.static(path.resolve(process.cwd(), 'js')));
+  app.use('/css', express.static(path.resolve(process.cwd(), 'css')));
+  app.use('/assets', express.static(path.resolve(process.cwd(), 'assets')));
+
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true, hmr: false },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(staticRoot));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve(staticRoot, 'index.html'));
+    });
+  }
+
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Tatito Financial Services Full-Stack Server running at http://0.0.0.0:${PORT}`);
+  });
+
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws/notifications' });
+  registerWebSocketServer(wss);
+
+  return httpServer;
+}
+
+// Auto-start when executed directly (not imported by test runner or Vercel serverless)
+const isDirectRun = process.argv[1]?.endsWith('server.ts') || process.argv[1]?.endsWith('server.js');
+if (isDirectRun && process.env.NODE_ENV !== 'test') {
+  startServer().catch((err) => {
+    console.error('Fatal: Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+export default app;

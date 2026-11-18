@@ -1,0 +1,195 @@
+import { Router } from 'express';
+import type { Request, Response } from 'express';
+import { dbRepository, logAudit } from '../../database/db.ts';
+import { requireAuth, type AuthenticatedRequest } from '../middleware/auth.ts';
+import { broadcastRealtimeNotification } from '../services/realtime.ts';
+
+const router = Router();
+
+// GET /api/payments/history
+router.get('/history', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const list = await dbRepository.payments.getByUser(req.user!.userId);
+    res.json(list);
+  } catch (err: any) {
+    if (err.statusCode === 503) {
+      return res.status(503).json({ error: 'Service Unavailable', detail: err.message });
+    }
+    res.status(500).json({ error: 'Internal Error', detail: err.message });
+  }
+});
+
+// POST /api/payments/bills/fetch
+router.post('/bills/fetch', (req: Request, res: Response) => {
+  const { category, operator, account_identifier } = req.body;
+  const cleanId = (account_identifier || '1009823412034').trim();
+
+  let hash = 0;
+  for (let i = 0; i < cleanId.length; i++) hash += cleanId.charCodeAt(i);
+
+  const names = [
+    'Ramesh Kumar Chennur', 'Venkata Subba Reddy', 'Lakshmi Narayana Rao',
+    'Sunitha Devi Giddalur', 'Ankalaiah Bandlamudi'
+  ];
+  const customerName = names[hash % names.length];
+
+  let amount = 1420;
+  if (category === 'electricity') amount = 850 + (hash % 2200);
+  else if (category === 'water') amount = 180 + (hash % 380);
+  else if (category === 'gas' || category === 'lpg_gas') amount = 950 + (hash % 120);
+  else if (category === 'piped_gas') amount = 640 + (hash % 750);
+  else if (category === 'mobile' || category === 'mobile_prepaid') amount = [299, 349, 479, 666, 839][hash % 5];
+  else if (category === 'mobile_postpaid') amount = 599 + (hash % 800);
+  else if (category === 'dth') amount = [250, 399, 499, 650][hash % 4];
+  else if (category === 'fastag') amount = [500, 1000, 1500, 2000][hash % 4];
+  else if (category === 'broadband') amount = [589, 825, 1179][hash % 3];
+  else if (category === 'landline') amount = [499, 699, 999][hash % 3];
+  else if (category === 'credit_card') amount = 4250 + (hash % 15000);
+  else if (category === 'insurance_premium') amount = 4850 + (hash % 6500);
+  else if (category === 'rent') amount = 8500 + (hash % 9000);
+  else if (category === 'education_fees') amount = 12500 + (hash % 15000);
+  else if (category === 'municipal_tax') amount = 1850 + (hash % 2400);
+  else if (category === 'subscriptions') amount = [199, 299, 499, 999][hash % 4];
+
+  const now = new Date();
+  const billDate = new Date(now.getTime() - 7 * 86400000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+  const dueDate = new Date(now.getTime() + 8 * 86400000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+  const bbpsRef = `DEMO-BBPS-${10000000 + (hash % 89999999)}`;
+  const noticeText = 'DEMO DATA: Simulated bill fetch. Not an active fetch from live NPCI BBPS Central Unit.';
+
+  return res.json({
+    customer_name: customerName,
+    account_identifier: cleanId,
+    operator: operator || 'APSPDCL (Southern Power AP)',
+    category: category || 'electricity',
+    bill_number: `DEMO-BILL-${100000 + (hash % 899999)}`,
+    bill_date: billDate,
+    due_date: dueDate,
+    amount_due: amount,
+    bill_amount: amount,
+    convenience_fee: 0.0,
+    bbps_reference: bbpsRef,
+    bbps_biller_id: bbpsRef,
+    status: 'PENDING',
+    circle: 'Andhra Pradesh (Kadapa Circle)',
+    is_demo: true,
+    data_source: 'DEMO_BILLER_CATALOG',
+    notice: noticeText,
+    disclaimer: noticeText
+  });
+});
+
+// POST /api/payments/bills/pay
+router.post('/bills/pay', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { category, operator, account_identifier, customer_name, amount, payment_mode } = req.body;
+    const idempotencyKey = (
+      req.headers['idempotency-key'] ||
+      req.headers['x-idempotency-key'] ||
+      req.body.idempotency_key ||
+      req.body.idempotencyKey
+    ) as string | undefined;
+
+    if (idempotencyKey) {
+      const existingPayment = await dbRepository.payments.findByIdempotencyKey(idempotencyKey, req.user!.userId);
+      if (existingPayment) {
+        return res.json({
+          status: existingPayment.status,
+          transaction_reference: existingPayment.payment_ref,
+          bbps_reference: existingPayment.bbps_ref_no,
+          amount_paid: parseFloat(existingPayment.amount),
+          idempotent_replay: true,
+          message: 'Payment already processed with this idempotency key. No duplicate deduction.',
+          paid_at: existingPayment.created_at
+        });
+      }
+    }
+
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || !Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: 'Bad Request', detail: 'Invalid payment amount. Must be a positive number.' });
+    }
+
+    if (!category || !account_identifier) {
+      return res.status(400).json({ error: 'Bad Request', detail: 'category and account_identifier are required.' });
+    }
+
+
+
+    const simulateFailure = req.body.simulate_failure === true || req.headers['x-simulate-failure'] === 'true';
+    if (simulateFailure) {
+      return res.status(400).json({
+        error: 'Payment Processing Failed',
+        detail: 'Simulated processor decline: Transaction rejected by biller network. Wallet balance untouched.',
+        is_demo: true,
+        is_simulated: true
+      });
+    }
+
+    const payStatus = 'DEMO_SUCCESS';
+
+    const result = await dbRepository.payments.executeAtomicWalletPayment({
+      userId: req.user!.userId,
+      amount: amt,
+      category: category || 'utility',
+      operator: operator || 'Utility Biller',
+      accountIdentifier: account_identifier,
+      paymentMode: payment_mode || 'wallet',
+      status: payStatus,
+      idempotencyKey,
+      metaJson: {
+        customer_name: customer_name || req.user!.fullName,
+        circle: 'Andhra Pradesh',
+        channel: 'Bharat BillPay (BBPS) Sandbox Simulator',
+        is_demo: true
+      }
+    });
+
+    await dbRepository.notifications.create({
+      user_id: req.user!.userId,
+      title: 'Bill Payment Completed',
+      message: `₹${amt.toLocaleString('en-IN')} paid for ${operator || 'utility'}. Ref: ${result.payment.payment_ref}`,
+      category: 'general'
+    });
+    broadcastRealtimeNotification(req.user!.userId, {
+      title: 'Bill Payment Completed',
+      message: `₹${amt.toLocaleString('en-IN')} paid for ${operator || 'utility'} (${result.payment.payment_ref})`,
+      category: 'payments',
+      reference: result.payment.payment_ref,
+      amount: amt
+    });
+
+    logAudit(req.user!.userId, 'PAY_BILL', 'payments', result.payment.payment_ref, {
+      operator,
+      amount: amt,
+      status: payStatus,
+      isDemo: true
+    });
+
+    return res.json({
+      status: result.payment.status,
+      is_demo: true,
+      is_simulated: true,
+      transaction_reference: result.payment.payment_ref,
+      bbps_reference: result.payment.bbps_ref_no,
+      amount_paid: amt,
+      wallet_balance: result.newBalance,
+      paid_at: result.payment.created_at || new Date().toISOString(),
+      compliance_notice: 'DEMO TRANSACTION: Simulated utility payment in sandbox environment. No actual bank clearing occurred.'
+    });
+  } catch (err: any) {
+    if (err.statusCode === 503) {
+      return res.status(503).json({ error: 'Service Unavailable', detail: err.message });
+    }
+    if (err.statusCode === 400) {
+      return res.status(400).json({ error: 'Payment Error', detail: err.message });
+    }
+    if (err.statusCode === 404) {
+      return res.status(404).json({ error: 'Not Found', detail: err.message });
+    }
+    console.error('Bill pay error:', err);
+    return res.status(500).json({ error: 'Internal Error', detail: err.message });
+  }
+});
+
+export default router;
